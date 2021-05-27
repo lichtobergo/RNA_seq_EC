@@ -1,0 +1,502 @@
+---
+title: "EC RNASeq Arianna "
+output: html_notebook
+---
+
+This is the analysis of RNA Seq data from endothelial cells isolated from rat
+brain dura, leptomeninges and parenchyma. Animals were either naive or injected
+with OVA-specific T effector cells.
+
+```{r load libraries, warning=FALSE}
+library(tidyverse)
+library(tximport)
+library(DESeq2)
+library(biomaRt)
+
+```
+
+# ---------- Import and pre-process --------------------------------------------
+```{r make samples table}
+files <- list.files(
+  path = "raw_gene_counts/", 
+  pattern = "*.genes.results",
+  full.names = T
+)
+
+files <- files[str_detect(files, "N_") & str_detect(files, "BD|BA")]
+
+samples <- tibble(
+  file_path = files,
+  sample_name = basename(file_path) %>% 
+    str_remove(".genes.results")
+)
+
+samples %>% 
+  mutate(
+    tissue = factor(
+      case_when(
+        str_detect(sample_name, "BA") ~ "Br. lepto",
+        str_detect(sample_name, "BD") ~ "Br. dura",
+        str_detect(sample_name, "BP") ~ "Br. par"
+             ),
+      levels = c("Br. lepto", "Br. dura", "Br. par")
+    ),
+    condition = case_when(
+      str_detect(sample_name, "^E_") ~ "EAE",
+      str_detect(sample_name, "^N_") ~ "naive",
+      str_detect(sample_name, "^O_") ~ "OVA"
+    ),
+    group = str_c(tissue, condition),
+    condition = factor(condition, levels = c("naive", "EAE", "OVA")),
+    group = as.factor(group)
+  ) %>% 
+  base::as.data.frame() ->
+  samples
+
+```
+
+
+```{r}
+names(files) <- samples %>%
+  dplyr::select(sample_name) %>% 
+  pull()
+txi.rsem <- tximport(
+  files = files,
+  type = "rsem",
+  txIn = F,
+  txOut = F
+)
+head(txi.rsem$counts)
+```
+
+Connect to biomaRt database for gene annotation purposes
+```{r biomaRt}
+ensembl <- useMart("ensembl")
+ensembl <- useDataset("rnorvegicus_gene_ensembl", mart = ensembl)
+attributes <- listAttributes(ensembl)
+attributes[1:10, ]
+gene2name <- getBM(
+  attributes = c(
+    "ensembl_gene_id",
+    "external_gene_name"
+  ),
+  mart = ensembl,
+  useCache = F
+)
+gene2desc <- getBM(
+  attributes = c(
+    "ensembl_gene_id",
+    "external_gene_name",
+    "description",
+    "start_position",
+    "end_position",
+    # "transcript_length",
+    "strand",
+    "gene_biotype"
+  ),
+  mart = ensembl,
+  useCache = F
+)
+
+```
+
+# ---------- Analysis with DESeq2 ----------------------------------------------
+```{r}
+rownames(samples) <- colnames(txi.rsem$counts)
+txi.rsem$length[txi.rsem$length == 0] <- 1
+dds <- DESeqDataSetFromTximport(
+  txi.rsem,
+  samples,
+  ~ tissue
+)
+```
+
+```{r Run DESeq2 pipeline}
+keep <- rowSums(counts(dds)) >= 10
+dds <- dds[keep, ]
+dds <- DESeq(dds)
+
+```
+
+
+```{r Plot dispersion}
+plotDispEsts(dds, main = "Dispersion plot")
+png("!qc-dispersion.png", 1000, 1000, pointsize = 20)
+plotDispEsts(dds, main = "Dispersion plot")
+dev.off()
+
+```
+
+
+```{r Regularized log transformation for clustering/heatmaps}
+
+rld <- rlog(dds, blind = F)
+head(assay(rld))
+hist(assay(rld))
+
+```
+
+
+```{r meanSdPlot}
+
+library("vsn")
+meanSdPlot(assay(rld))
+
+```
+
+
+```{r Colors for plots below}
+
+library(RColorBrewer)
+# (mycols <- brewer.pal(8, "Dark2")[1:length(unique(samples$tissue))])
+mycols <- c("#EE0000", "#1C86EE", "#000000")
+
+```
+
+```{r Sample distance heatmap}
+
+sampleDists <- as.matrix(dist(t(assay(rld))))
+library(gplots)
+png("qc-heatmap-samples.png", w=1000, h=1000, pointsize=20)
+heatmap.2(
+  as.matrix(sampleDists), 
+  key=F, trace="none",
+  col=colorpanel(100, "black", "white"),
+  ColSideColors=mycols[as.factor(samples$tissue)], 
+  RowSideColors=mycols[as.factor(samples$tissue)],
+  margin=c(10, 10), main="Sample Distance Matrix")
+dev.off()
+
+```
+
+
+
+```{r Principle component analysis}
+
+# old method via Deseq2 and ggplot
+library(ggsci)
+plotPCA(rld, intgroup = "tissue")
+pcaData <- plotPCA(rld, intgroup = "tissue", returnData = T)
+percentVar <- round(100 * attr(pcaData, "percentVar"))
+PCA_plot_SM <- ggplot(
+  pcaData,
+  aes(
+    PC1,
+    PC2,
+    color = tissue
+  )
+) +
+  geom_point(size = 2) +
+  xlab(paste0("PC1: ", percentVar[1], "% variance")) +
+  ylab(paste0("PC2: ", percentVar[2], "% variance")) +
+  # coord_fixed(xlim = c(-20, 20), ylim = c(-20, 20)) +
+  theme_bw(base_size = 8) +
+  theme(
+    text = element_text(colour = "black"),
+    axis.text = element_text(colour = "black"),
+    line = element_line(colour = "black"),
+    panel.grid = element_blank(),
+    legend.position = "top",
+    plot.title = element_text(hjust = 0.5)
+  ) + 
+  ggtitle("PCA-plot") +
+  scale_color_npg()
+ggsave(
+  "PCA_plot_BA_vs_BD.eps",
+  plot = PCA_plot_SM, 
+  path = "plots_paper/",
+  device = cairo_ps,
+  width = 6,
+  height = 6, 
+  units = "cm"
+)
+PCA_plot_SM
+
+# new method using PCAtools
+library(PCAtools)
+p <- pca(assay(rld), metadata = colData(rld), removeVar = .1)
+cairo_ps(
+  filename = "plots_paper/PCA_plot_BA_vs_BD.eps",
+  width = 8,
+  height = 7,
+  pointsize = 8,
+  fallback_resolution = 300
+)
+biplot(
+  p,
+  lab = NULL,
+  colby = "tissue",
+  colkey = c("Leptomeninges" = "#1b9e77", "Dura" = "#7570b3"),
+  legendPosition = "top"
+)
+dev.off()
+
+ggsave(
+  filename = "PCA_plot_BA_vs_BD.pdf",
+  plot = last_plot(),
+  device = cairo_pdf,
+  path = "plots_paper",
+  width = 6,
+  height = 4,
+  units = "cm",
+  dpi = "print"
+)
+
+
+```
+
+```{r Get differential expression results}
+
+res <- results(dds)
+table(res$padj < 0.05)
+# order by adjusted p-value
+res <- res[order(res$padj), ]
+# Merge with normalized count data
+resdata <- merge(
+  as.data.frame(res),
+  as.data.frame(counts(dds, normalized = TRUE)), by = "row.names", sort = FALSE)
+names(resdata)[1] <- "Gene"
+head(resdata)
+# Write results as 
+
+
+```
+
+```{r visualize most regulated genes}
+
+library(pheatmap)
+select_genes <- rownames(subset(res, padj < 0.05 & padj != 0 & abs(log2FoldChange) > 1))[1:50]
+gene2name %>% 
+  filter(ensembl_gene_id %in% select_genes)
+annotation_colors <- list(
+  tissue = c("Br. leptomeninges" = pal_npg("nrc")(10)[1], "Br. dura" = pal_npg("nrc")(10)[2]))
+heatmap <- pheatmap(
+  t(assay(rld)[select_genes, ]), scale = "column",
+  cluster_rows = F, 
+  cluster_cols = T,
+  annotation_row = samples[, "tissue", drop = F], 
+  show_rownames = F,
+  show_colnames = T,
+  annotation_colors = annotation_colors,
+  cellheight = 10
+)
+
+
+```
+
+
+
+```{r}
+
+dds <- DESeq(dds)
+# construct lists of group names for programmatically extracting contrasts
+# source vector
+sourceV <- samples %>% 
+  # filter(
+  #   condition == "OVA"
+  # ) %>%
+  pull(group) %>% 
+  unique() %>% 
+  as.character()
+contr_tbl <- gtools::combinations(
+  8, 
+  2, 
+  repeats.allowed = F,
+  v = sourceV
+) %>% 
+  as_tibble()
+contr_tbl <- add_row(
+  contr_tbl, 
+  V1 = c("BAnaive", "BDnaive", "BPnaive", "CRnaive"), 
+  V2 = c("BAOVA", "BDOVA", "BPOVA", "CROVA")
+)
+contr_list_1 <- contr_tbl %>% 
+  pull(V1)
+contr_list_2 <- contr_tbl %>% 
+  pull(V2)
+contr_names <- paste0(contr_list_1, "_vs_", contr_list_2)
+res <- map2(
+  contr_list_1,
+  contr_list_2, 
+  ~ results(
+  dds,
+  contrast = c("group", .x, .y),
+  alpha = 0.05,
+  tidy = T
+) %>%
+  dplyr::filter(
+    padj < 0.05,
+    abs(log2FoldChange) >= 1
+  ) %>% 
+  left_join(
+    .,
+    gene2desc,
+    by = c("row" = "ensembl_gene_id")
+  )
+)
+names(res) <- contr_names
+
+res %>%
+  map2(
+    .y = names(res),
+    ~ openxlsx::write.xlsx(
+      x = .x, 
+      file = paste0("NGS_EC_results_arianna/", "candidates_", .y, ".xlsx"),
+      firstRow = TRUE
+    )
+  )
+
+```
+
+
+
+```{r }
+
+#
+selection_vector <- factor(
+  c(
+  "Vcam1",
+  "Icam1",
+  "Sele",
+  "Selp",
+  "Fn1",
+  "Ocln",
+  "Cldn5",
+  "Cxcl9",
+  "Cxcl10",
+  "Cxcl11",
+  "Cxcl12",
+  "Cx3cl1"
+  ),
+  ordered = T
+  )
+genes_of_interest <- gene2name %>% 
+  filter(
+    external_gene_name %in% selection_vector
+  ) %>% 
+  distinct(ensembl_gene_id, .keep_all = T) %>% 
+  mutate(
+    external_gene_name = factor(
+      external_gene_name,
+      levels = c(
+        "Vcam1",
+        "Icam1",
+        "Sele",
+        "Selp",
+        "Fn1",
+        "Ocln",
+        "Cldn5",
+        "Cxcl9",
+        "Cxcl10",
+        "Cxcl11",
+        "Cxcl12",
+        "Cx3cl1"
+      )
+    )
+  ) %>% 
+  arrange(external_gene_name)
+genes_of_interest$external_gene_name
+genes_of_interest$ensembl_gene_id
+#
+GoI_tbl <- genes_of_interest$ensembl_gene_id %>%
+  map(
+    ~plotCounts(
+      dds,
+      normalized = T,
+      gene = .x, 
+      intgroup = "tissue", 
+      returnData = T
+    ),
+    .id = "gene"
+  ) %>% 
+  set_names(genes_of_interest$ensembl_gene_id) %>% 
+  map_dfr(bind_rows, .id = "ensembl_gene_id") %>% 
+  left_join(
+    gene2name %>% 
+      dplyr::select(ensembl_gene_id, external_gene_name) %>% 
+      distinct()) %>% 
+  mutate(
+    external_gene_name = factor(
+      external_gene_name,
+      levels = c(
+        "Vcam1",
+        "Icam1",
+        "Sele",
+        "Selp",
+        "Fn1",
+        "Ocln",
+        "Cldn5",
+        "Cxcl9",
+        "Cxcl10",
+        "Cxcl11",
+        "Cxcl12",
+        "Cx3cl1"
+      )
+    )
+  )
+head(GoI_tbl)
+
+
+```
+
+
+```{r}
+
+counts_plot <- GoI_tbl %>%
+  # filter(
+  #   tissue == "SM"
+  # ) %>% 
+  ggplot(
+    aes(
+      x = tissue,
+      y = log10(count),
+      color = tissue
+    )
+  ) +
+  geom_jitter(
+    size = .5,
+    width = .2
+  ) +
+  facet_wrap(
+   vars(external_gene_name),
+   nrow = 2,
+   scales = "free"
+  ) +
+  theme_bw(
+    base_size = 8
+  ) +
+  theme(
+    text = element_text(colour = "black"),
+    axis.title.x = element_blank(),
+    axis.text.x = element_blank(),
+    legend.position = "top",
+    legend.title = element_blank(),
+    legend.text = element_text(size = 10),
+    aspect.ratio = 1,
+    strip.background = element_blank()
+    ) +
+  ylab(expression(normalized~counts~-~" "~log[10]~scale)) +
+  scale_color_manual(values = mycols)
+
+
+# test save function from cowplot
+cowplot::save_plot(
+  filename = "counts_plot.pdf",
+  plot = counts_plot,
+  path = "plots_paper//",
+  base_aspect_ratio = 1.3
+)
+
+ggsave(
+  "counts_plot.eps", 
+  plot = counts_plot,
+  path = "plots_paper/", 
+  device = cairo_ps, 
+  width = 10,
+  units = "cm"
+)
+counts_plot
+
+```
+
+

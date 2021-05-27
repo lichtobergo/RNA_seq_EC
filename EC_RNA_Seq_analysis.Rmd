@@ -1,0 +1,401 @@
+---
+title: "Endothelial cell RNA-Seq analysis"
+output: 
+  html_notebook:
+    toc: yes
+---
+
+This is the analysis of RNA-Sequencing of endothelial cells isolated from rat CNS tissue
+
+### Load libraries
+```{r load libraries, message=FALSE, warning=FALSE}
+library(tidyverse)
+library(tximport)
+library(DESeq2)
+library(biomaRt)
+library(DEGreport)
+library(pheatmap)
+library(glmpca)
+library(openxlsx)
+`%notin%` <- Negate(`%in%`)
+
+```
+
+
+### Make dataframe with samples names and information
+```{r make samples table}
+# list all count files
+files <- list.files(
+  path = "raw_gene_counts/", 
+  pattern = "*.genes.results",
+  full.names = T
+)
+
+# files <- files[str_detect(files, "E_|N_")]
+# construct "column data" (as described in DESeq2 vignette)" tibble for sample annotation
+samples <- tibble(
+  file_path = files,
+  sample_name = basename(file_path) %>% 
+    str_remove(".genes.results")
+)
+# parse sample name for sample information
+samples %>% 
+  mutate(
+    tissue = case_when(
+      str_detect(sample_name, "BA") ~ "BA",
+      str_detect(sample_name, "BD") ~ "BD",
+      str_detect(sample_name, "BP") ~ "BP",
+      str_detect(sample_name, "SM") ~ "SM",
+      str_detect(sample_name, "SP") ~ "SP",
+      str_detect(sample_name, "CR") ~ "CR"
+    ),
+    condition = case_when(
+      str_detect(sample_name, "^E_") ~ "EAE",
+      str_detect(sample_name, "^N_") ~ "naive",
+      str_detect(sample_name, "^O_") ~ "OVA"
+    ),
+    group = str_c(tissue, condition),
+    condition = factor(condition, levels = c("naive", "EAE", "OVA")),
+    group = as.factor(group)
+  ) %>% 
+  base::as.data.frame() ->
+  samples
+samples
+
+```
+
+
+### Import count tables per sample
+```{r import count data}
+
+names(files) <- samples %>%
+  dplyr::select(sample_name) %>% 
+  pull()
+# make tximport object
+txi.rsem <- tximport(
+  files = files,
+  type = "rsem",
+  txIn = F,
+  txOut = F
+)
+head(txi.rsem$counts, 5)
+```
+
+
+
+### Make DESeq2 object
+```{r DESeq2 object}
+rownames(samples) <- colnames(txi.rsem$counts)
+txi.rsem$length[txi.rsem$length == 0] <- 1
+dds <- DESeqDataSetFromTximport(
+  txi.rsem,
+  samples,
+  ~ group
+)
+```
+
+
+### Pre-filtering step
+```{r pre-filtering}
+keep <- rowMeans(counts(dds)) >= 10
+keep <- rowSums(counts(dds) >= 10) > 18
+dds <- dds[keep, ]
+
+```
+
+
+### Count data transformation for visualization puropses
+```{r count data transformation}
+
+library("vsn")
+vsd <- vst(dds, blind = T)
+ntd <- normTransform(dds)
+
+```
+
+
+
+```{r}
+meanSdPlot(assay(ntd))
+```
+
+
+
+```{r}
+meanSdPlot(assay(vsd))
+```
+
+
+### Qualitiy control by PCA
+```{r PCA plot}
+# make dataframe for PCA plot by ggplot
+pcaData <- plotPCA(vsd, intgroup = c("tissue", "condition"), returnData = TRUE)
+percentVar <- round(100 * attr(pcaData, "percentVar"))
+# plot PCA
+ggplot(pcaData, aes(PC1, PC2, color=tissue, shape = condition)) +
+  scale_color_viridis_d()+
+  geom_point(size=3) +
+  xlab(paste0("PC1: ",percentVar[1],"% variance")) +
+  ylab(paste0("PC2: ",percentVar[2],"% variance")) + 
+  theme(panel.background = element_blank(),
+        panel.border = element_rect(fill = "transparent"))
+
+```
+
+
+
+```{r}
+resCov <- degCovariates(log2(counts(dds) + 0.5), colData(dds))
+```
+
+
+### Get gene annotation information from Ensembl via biomaRt
+```{r biomaRt}
+
+ensembl <- useMart("ensembl")
+listDatasets(ensembl)
+ensembl <- useDataset("rnorvegicus_gene_ensembl", mart = ensembl)
+attributes <- listAttributes(ensembl)
+attributes[1:100, ]
+gene2name <- getBM(
+  attributes = c(
+    "ensembl_gene_id",
+    "external_gene_name",
+    "entrezgene_id"
+    
+  ),
+  mart = ensembl
+)
+
+```
+
+
+
+```{r}
+dds <- DESeq(dds)
+
+# write normalized counts for all samples and genes to disk
+counts(
+  dds,
+  normalized = T
+) %>% 
+  as.data.frame() %>% 
+  rownames_to_column(var = "ensembl_gene_id") %>% 
+  left_join(
+    gene2name
+  ) %>% 
+  openxlsx::write.xlsx(
+    file = "normalized_counts.xlsx",
+    firstRow = TRUE
+  )
+# colData(dds)$group <- relevel(colData(dds)$group, ref = "SMnaive")
+# samples <- samples %>% 
+#   mutate(group = relevel(group, ref = "SMnaive"))
+# dds <- nbinomWaldTest(dds)
+# res <- results(dds, name = "group_SMEAE_vs_SMnaive" , alpha = 0.05)
+
+# get DEG using the multiple comparison functionality from the DEGreport package
+degs <- degComps(
+  dds,
+  # combs = "group",
+  contrast = list(c("group", "SMnaive", "CRnaive"),
+                  c("group", "SMEAE", "CRnaive"),
+                  c("group", "SMEAE","SMnaive" ),
+                  c("group", "SMOVA", "SMnaive"),
+                  c("group", "SMnaive", "BAnaive"),
+                  c("group", "SMnaive", "BDnaive"),
+                  c("group", "CRnaive", "BDnaive"),
+                  c("group", "BAOVA", "BAnaive"),
+                  c("group", "BDOVA", "BDnaive"),
+                  c("group", "BPOVA", "BPnaive"),
+                  c("group", "BAnaive", "BDnaive"),
+                  c("group", "BDnaive", "BPnaive"),
+                  c("group", "BAnaive", "BPnaive"),
+                  c("group", "CRnaive", "BDnaive"),
+                  c("group", "CRnaive", "BAnaive"),
+                  c("group", "CRnaive", "BPnaive")
+                  ),
+  alpha = 0.05
+)
+
+# filter significant genes for each contrast
+sigDEG <- degs %>% 
+  map(
+    ~ significants(.x, fc = 1, fdr = 0.05, full = T)
+  )
+
+# annotate if genes are either up- or downregulated an annotate with entrez id
+sigDEG <- sigDEG %>% 
+  map(
+    ~ .x %>% 
+      mutate(regulation = if_else(log2FoldChange < 0, 
+                                  "downregulated",
+                                  "upregulated")
+      ) %>% 
+      inner_join(dplyr::select(
+        gene2name,
+        ensembl_gene_id, 
+        external_gene_name
+      ),
+      by = c("gene" = "ensembl_gene_id"))
+  )
+
+# write DEG lists as Excel xlsx files
+names(sigDEG) %>% 
+  str_replace(
+    "group",
+    "DEG"
+  ) %>% 
+  map2(
+    .y = sigDEG,
+    ~ openxlsx::write.xlsx(
+      x = .y, 
+      file = paste0("results/", .x, ".xlsx"),
+      firstRow = TRUE
+    )
+  )
+
+# pathway analysis with DEGreport package
+library(clusterProfiler)
+library(org.Rn.eg.db)
+ck <- sigDEG[1] %>% 
+  
+  map(
+    ~ compareCluster(entrezgene_id ~ regulation,
+                     data = .x, 
+                     fun = "enrichGO", 
+                     OrgDb = org.Rn.eg.db,
+                     ont = "BP",
+                     pvalueCutoff = 0.05)
+    
+  )
+purrr:::walk(
+  ck,
+  ~ dotplot(.x)
+)
+dotplot(ck[[1]])
+summary(res)
+```
+
+
+
+```{r}
+resSig <- subset(res, padj < 0.05 & abs(log2FoldChange) > 1)
+resSM <- left_join(
+  as_tibble(
+    resSig,
+    rownames = "ensembl_gene_id"
+  ),
+  gene2name
+)
+resSM %>% 
+  as.data.frame() %>% 
+  openxlsx::write.xlsx(
+    ., 
+    "results/group_SMEAE_vs_SMnaive.xlsx",
+    firstRow = TRUE)
+  write.csv(., file = "results/group_SMEAE_vs_SMnaive.csv")
+
+```
+
+
+
+```{r SP contrast}
+res <- results(dds, contrast = c("group", "SPEAE", "SPnaive"), alpha = 0.05)
+summary(res)
+resSig <- subset(res, padj < 0.05 & abs(log2FoldChange) > 0.58)
+resSP <- left_join(
+  as_tibble(
+    resSig,
+    rownames = "ensembl_gene_id"
+  ),
+  gene2name
+)
+resSP %>% 
+  as.data.frame() %>% 
+  write.csv(., file = "results/group_SPEAE_vs_SPnaive.csv")
+
+```
+
+
+
+```{r}
+res <- results(dds, contrast = c("group", "CREAE", "CRnaive"), alpha = 0.05)
+summary(res)
+resSig <- subset(res, padj < 0.05 & abs(log2FoldChange) > 1)
+resCR <- left_join(
+  as_tibble(
+    resSig,
+    rownames = "ensembl_gene_id"
+  ),
+  gene2name
+)
+resCR %>% 
+  as.data.frame() %>% 
+  write.csv(., file = "results/group_CREAE_vs_CRnaive.csv")
+
+```
+
+
+
+```{r}
+res <- results(dds, contrast = c("group", "BAEAE", "BAnaive"), alpha = 0.05)
+summary(res)
+resSig <- subset(res, padj < 0.05 & abs(log2FoldChange) > 1)
+resBA <- left_join(
+  as_tibble(
+    resSig,
+    rownames = "ensembl_gene_id"
+  ),
+  gene2name
+)
+resBA %>% 
+  as.data.frame() %>% 
+  write.csv(., file = "results/group_BAEAE_vs_BAnaive.csv")
+
+```
+
+
+
+```{r}
+res <- results(dds, contrast = c("group", "BDEAE", "BDnaive"), alpha = 0.05)
+summary(res)
+resSig <- subset(res, padj < 0.05 & abs(log2FoldChange) > 1)
+resBD <- left_join(
+  as_tibble(
+    resSig,
+    rownames = "ensembl_gene_id"
+  ),
+  gene2name
+)
+resBD %>% 
+  as.data.frame() %>% 
+  write.csv(., file = "results/group_BDEAE_vs_BDnaive.csv")
+```
+
+
+
+```{r}
+res <- results(dds, contrast = c("group", "BPEAE", "BPnaive"), alpha = 0.05)
+summary(res)
+resSig <- subset(res, padj < 0.05 & abs(log2FoldChange) > 1)
+resBP <- left_join(
+  as_tibble(
+    resSig,
+    rownames = "ensembl_gene_id"
+  ),
+  gene2name
+)
+resBP %>% 
+  as.data.frame() %>% 
+  write.csv(., file = "results/group_BPEAE_vs_BPnaive.csv")
+```
+
+
+
+```{r}
+resSM %>%
+  semi_join(resBA, by = "external_gene_name")
+```
+
+

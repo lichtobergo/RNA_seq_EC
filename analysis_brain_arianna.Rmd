@@ -1,0 +1,219 @@
+---
+title: "EC RNASeq Arianna "
+output: html_notebook
+---
+
+This is the analysis of RNA Seq data from endothelial cells isolated from rat
+brain dura, leptomeninges and parenchyma. Animals were either naive or injected
+with OVA-specific T effector cells.
+
+```{r load libraries, warning=FALSE}
+library(tidyverse)
+library(tximport)
+library(DESeq2)
+library(biomaRt)
+
+```
+
+
+```{r make samples table}
+files <- list.files(
+  path = "raw_gene_counts/", 
+  pattern = "*.genes.results",
+  full.names = T
+)
+
+files <- files[str_detect(files, "O_|N_") & str_detect(files, "BP|BD|BA|CR")]
+
+samples <- tibble(
+  file_path = files,
+  sample_name = basename(file_path) %>% 
+    str_remove(".genes.results")
+)
+
+samples %>% 
+  mutate(
+    tissue = case_when(
+      str_detect(sample_name, "BA") ~ "BA",
+      str_detect(sample_name, "BD") ~ "BD",
+      str_detect(sample_name, "BP") ~ "BP",
+      str_detect(sample_name, "SM") ~ "SM",
+      str_detect(sample_name, "SP") ~ "SP",
+      str_detect(sample_name, "CR") ~ "CR"
+    ),
+    condition = case_when(
+      str_detect(sample_name, "^E_") ~ "EAE",
+      str_detect(sample_name, "^N_") ~ "naive",
+      str_detect(sample_name, "^O_") ~ "OVA"
+    ),
+    group = str_c(tissue, condition),
+    condition = factor(condition, levels = c("naive", "EAE", "OVA")),
+    group = as.factor(group)
+  ) %>% 
+  base::as.data.frame() ->
+  samples
+
+```
+
+
+```{r}
+names(files) <- samples %>%
+  dplyr::select(sample_name) %>% 
+  pull()
+txi.rsem <- tximport(
+  files = files,
+  type = "rsem",
+  txIn = F,
+  txOut = F
+)
+head(txi.rsem$counts)
+```
+
+Connect to biomaRt database for gene annotation purposes
+```{r biomaRt, }
+ensembl <- useMart("ensembl")
+ensembl <- useDataset("rnorvegicus_gene_ensembl", mart = ensembl)
+attributes <- listAttributes(ensembl)
+attributes[1:10, ]
+gene2name <- getBM(
+  attributes = c(
+    "ensembl_gene_id",
+    "external_gene_name"
+  ),
+  mart = ensembl
+)
+gene2desc <- getBM(
+  attributes = c(
+    "ensembl_gene_id",
+    "external_gene_name",
+    "description",
+    "start_position",
+    "end_position",
+    # "transcript_length",
+    "strand",
+    "gene_biotype"
+  ),
+  mart = ensembl
+)
+
+```
+
+
+```{r}
+rownames(samples) <- colnames(txi.rsem$counts)
+txi.rsem$length[txi.rsem$length == 0] <- 1
+dds <- DESeqDataSetFromTximport(
+  txi.rsem,
+  samples,
+  ~ group
+)
+```
+
+```{r}
+keep <- rowSums(counts(dds)) >= 10
+dds <- dds[keep, ]
+
+```
+
+
+```{r}
+vsd <- vst(dds, blind = F)
+rld <- rlog(dds, blind = F)
+```
+
+```{r}
+ntd <- normTransform(dds)
+library("vsn")
+meanSdPlot(assay(ntd))
+```
+
+
+```{r}
+meanSdPlot(assay(vsd))
+```
+
+```{r}
+meanSdPlot(assay(rld))
+```
+
+```{r}
+pcaData <- plotPCA(rld, intgroup = c("tissue", "condition"), returnData = TRUE)
+percentVar <- round(100 * attr(pcaData, "percentVar"))
+ggplot(pcaData, aes(PC1, PC2, color=tissue, shape = condition)) +
+  geom_point(size=3) +
+  xlab(paste0("PC1: ",percentVar[1],"% variance")) +
+  ylab(paste0("PC2: ",percentVar[2],"% variance")) + 
+  theme(panel.background = element_blank(),
+        panel.border = element_rect(fill = "transparent"))
+```
+
+
+```{r}
+
+dds <- DESeq(dds)
+# construct lists of group names for programmatically extracting contrasts
+# source vector
+sourceV <- samples %>% 
+  # filter(
+  #   condition == "OVA"
+  # ) %>%
+  pull(group) %>% 
+  unique() %>% 
+  as.character()
+contr_tbl <- gtools::combinations(
+  8, 
+  2, 
+  repeats.allowed = F,
+  v = sourceV
+) %>% 
+  as_tibble()
+contr_tbl <- add_row(
+  contr_tbl, 
+  V1 = c("BAnaive", "BDnaive", "BPnaive", "CRnaive"), 
+  V2 = c("BAOVA", "BDOVA", "BPOVA", "CROVA")
+)
+contr_list_1 <- contr_tbl %>% 
+  pull(V1)
+contr_list_2 <- contr_tbl %>% 
+  pull(V2)
+contr_names <- paste0(contr_list_1, "_vs_", contr_list_2)
+res <- map2(
+  contr_list_1,
+  contr_list_2, 
+  ~ results(
+  dds,
+  contrast = c("group", .x, .y),
+  alpha = 0.05,
+  tidy = T
+) %>%
+  dplyr::filter(
+    padj < 0.05,
+    abs(log2FoldChange) >= 1
+  ) %>% 
+  left_join(
+    .,
+    gene2desc,
+    by = c("row" = "ensembl_gene_id")
+  )
+)
+names(res) <- contr_names
+
+res %>%
+  map2(
+    .y = names(res),
+    ~ openxlsx::write.xlsx(
+      x = .x, 
+      file = paste0("NGS_EC_results_arianna/", "candidates_", .y, ".xlsx"),
+      firstRow = TRUE
+    )
+  )
+
+```
+
+
+```{r}
+
+
+
+```
+
